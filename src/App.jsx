@@ -53,21 +53,40 @@ export default function App() {
     setLoading(false);
   };
 
-  // Auth Functions
+  // Auth Functions with Detailed Error Logging
   const handleAuth = async (e) => {
     e.preventDefault();
     setAuthError('');
     setLoading(true);
 
-    if (authMode === 'signup') {
-      const { error } = await supabase.auth.signUp({ email, password });
-      if (error) setAuthError(error.message);
-      else alert('Signup successful! Check your email to confirm or sign in.');
-    } else {
-      const { error } = await supabase.auth.signInWithPassword({ email, password });
-      if (error) setAuthError(error.message);
+    try {
+      if (authMode === 'signup') {
+        const { data, error } = await supabase.auth.signUp({ email, password });
+        if (error) {
+          console.error('FULL SUPABASE SIGNUP ERROR:', error);
+          setAuthError(error.message);
+          alert(`Signup Error: ${error.message}`);
+        } else {
+          console.log('SIGNUP SUCCESS:', data);
+          alert('Signup successful! Check your email to confirm or sign in.');
+        }
+      } else {
+        const { data, error } = await supabase.auth.signInWithPassword({ email, password });
+        if (error) {
+          console.error('FULL SUPABASE SIGNIN ERROR:', error);
+          setAuthError(error.message);
+          alert(`Signin Error: ${error.message}`);
+        } else {
+          console.log('SIGNIN SUCCESS:', data);
+        }
+      }
+    } catch (err) {
+      console.error('CATCH BLOCK ERROR:', err);
+      setAuthError(err.message || 'An unexpected error occurred');
+      alert(`Unexpected Error: ${err.message}`);
+    } finally {
+      setLoading(false);
     }
-    setLoading(false);
   };
 
   const handleLogout = () => supabase.auth.signOut();
