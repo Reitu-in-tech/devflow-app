@@ -1,8 +1,5 @@
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
+@import "tailwindcss";
 
-/* Reset default margins and force dark theme background */
 html, body, #root {
   margin: 0;
   padding: 0;
