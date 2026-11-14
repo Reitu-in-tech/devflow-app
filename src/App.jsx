@@ -2,7 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { supabase } from './supabaseClient';
 import { 
   Plus, CheckCircle2, Circle, Clock, Sparkles, LogOut, 
-  Layers, Wrench, RefreshCw, User, Lock, Mail, Trash2, Search, Filter, Cpu 
+  Layers, Wrench, RefreshCw, User, Lock, Mail, Trash2, Search, Filter, FolderKanban 
 } from 'lucide-react';
 
 export default function App() {
@@ -13,16 +13,18 @@ export default function App() {
   const [authMode, setAuthMode] = useState('login');
   const [authError, setAuthError] = useState('');
 
-  // App Data State
+  // Projects State
+  const [projects, setProjects] = useState([]);
+  const [activeProject, setActiveProject] = useState(null);
+  const [isCreatingProject, setIsCreatingProject] = useState(false);
+  const [newProjectName, setNewProjectName] = useState('');
+
+  // Nodes Data State
   const [nodes, setNodes] = useState([]);
   const [selectedNode, setSelectedNode] = useState(null);
   const [newTitle, setNewTitle] = useState('');
   const [newPhase, setNewPhase] = useState('Frontend');
   const [newTools, setNewTools] = useState('');
-  
-  // AI Generator State
-  const [aiPrompt, setAiPrompt] = useState('');
-  const [aiGenerating, setAiGenerating] = useState(false);
 
   // UI Filter & Search
   const [searchTerm, setSearchTerm] = useState('');
@@ -31,32 +33,133 @@ export default function App() {
   useEffect(() => {
     supabase.auth.getSession().then(({ data: { session } }) => {
       setSession(session);
-      if (session) fetchNodes(session.user.id);
-      setLoading(false);
+      if (session) initializeUserWorkspace(session.user.id);
+      else setLoading(false);
     });
 
     const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
       setSession(session);
-      if (session) fetchNodes(session.user.id);
-      else setNodes([]);
+      if (session) initializeUserWorkspace(session.user.id);
+      else {
+        setProjects([]);
+        setActiveProject(null);
+        setNodes([]);
+      }
     });
 
     return () => subscription.unsubscribe();
   }, []);
 
-  const fetchNodes = async (userId) => {
+  // Load user's projects or create a default workspace on first load
+  const initializeUserWorkspace = async (userId) => {
     setLoading(true);
-    const { data, error } = await supabase
-      .from('nodes')
+    const { data: userProjects, error } = await supabase
+      .from('projects')
       .select('*')
       .eq('user_id', userId)
       .order('created_at', { ascending: true });
 
-    if (!error && data) {
-      setNodes(data);
-      if (data.length > 0 && !selectedNode) setSelectedNode(data[0]);
+    if (!error && userProjects) {
+      if (userProjects.length === 0) {
+        // Create default project and attach any legacy unassigned nodes to it
+        const { data: created, error: createError } = await supabase
+          .from('projects')
+          .insert([{ user_id: userId, name: 'DevFlow Core App' }])
+          .select();
+
+        if (!createError && created && created.length > 0) {
+          const defaultProj = created[0];
+          setProjects([defaultProj]);
+          setActiveProject(defaultProj);
+
+          // Link any pre-existing nodes without a project_id
+          await supabase
+            .from('nodes')
+            .update({ project_id: defaultProj.id })
+            .eq('user_id', userId)
+            .is('project_id', null);
+
+          await fetchNodes(userId, defaultProj.id);
+        }
+      } else {
+        setProjects(userProjects);
+        setActiveProject(userProjects[0]);
+        await fetchNodes(userId, userProjects[0].id);
+      }
     }
     setLoading(false);
+  };
+
+  const fetchNodes = async (userId, projectId) => {
+    if (!projectId) return;
+    const { data, error } = await supabase
+      .from('nodes')
+      .select('*')
+      .eq('user_id', userId)
+      .eq('project_id', projectId)
+      .order('created_at', { ascending: true });
+
+    if (!error && data) {
+      setNodes(data);
+      setSelectedNode(data.length > 0 ? data[0] : null);
+    }
+  };
+
+  const handleSelectProject = async (projectId) => {
+    const found = projects.find(p => p.id === projectId);
+    if (found && session) {
+      setActiveProject(found);
+      setSelectedNode(null);
+      setSearchTerm('');
+      setSelectedPhaseFilter('All');
+      await fetchNodes(session.user.id, found.id);
+    }
+  };
+
+  const handleCreateProject = async (e) => {
+    e.preventDefault();
+    if (!newProjectName.trim() || !session) return;
+
+    const { data, error } = await supabase
+      .from('projects')
+      .insert([{ user_id: session.user.id, name: newProjectName.trim() }])
+      .select();
+
+    if (!error && data && data.length > 0) {
+      const createdProj = data[0];
+      setProjects([...projects, createdProj]);
+      setActiveProject(createdProj);
+      setNodes([]);
+      setSelectedNode(null);
+      setNewProjectName('');
+      setIsCreatingProject(false);
+    } else if (error) {
+      alert('Error creating project: ' + error.message);
+    }
+  };
+
+  const handleDeleteCurrentProject = async () => {
+    if (!activeProject || projects.length <= 1) {
+      alert('You must have at least one active project workspace.');
+      return;
+    }
+
+    const confirmDelete = window.confirm(
+      `Delete "${activeProject.name}" and all its module nodes? This cannot be undone.`
+    );
+    if (!confirmDelete) return;
+
+    const { error } = await supabase
+      .from('projects')
+      .delete()
+      .eq('id', activeProject.id);
+
+    if (!error) {
+      const remaining = projects.filter(p => p.id !== activeProject.id);
+      setProjects(remaining);
+      setActiveProject(remaining[0]);
+      await fetchNodes(session.user.id, remaining[0].id);
+    }
   };
 
   const handleAuth = async (e) => {
@@ -93,12 +196,13 @@ export default function App() {
 
   const handleAddNode = async (e) => {
     e.preventDefault();
-    if (!newTitle.trim() || !session) return;
+    if (!newTitle.trim() || !session || !activeProject) return;
 
     const toolsArray = newTools.split(',').map(t => t.trim()).filter(Boolean);
 
     const newNode = {
       user_id: session.user.id,
+      project_id: activeProject.id,
       title: newTitle,
       status: 'todo',
       phase: newPhase,
@@ -119,55 +223,6 @@ export default function App() {
       setNewTools('');
     } else if (error) {
       alert('Error adding node: ' + error.message);
-    }
-  };
-
-  // AI-Powered Automated Node Insertion
-  const handleGenerateAiPlan = async (e) => {
-    e.preventDefault();
-    if (!aiPrompt.trim() || !session) return;
-
-    setAiGenerating(true);
-
-    try {
-      const response = await fetch("/api/generate-milestones", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ description: aiPrompt }),
-      });
-
-      if (!response.ok) throw new Error("AI Endpoint request failed");
-
-      const generatedMilestones = await response.json();
-
-      // Convert generated milestones to the schema array
-      const mappedNodes = generatedMilestones.map((milestone, idx) => ({
-        user_id: session.user.id,
-        title: milestone.title,
-        status: "todo",
-        phase: milestone.phase,
-        recommended_tools: milestone.recommended_tools || ["General Tools"],
-        x_pos: 120 + (nodes.length * 20) + (idx * 50),
-        y_pos: 120 + (nodes.length * 20) + (idx * 30),
-      }));
-
-      // Batch insert nodes to Supabase
-      const { data, error } = await supabase
-        .from("nodes")
-        .insert(mappedNodes)
-        .select();
-
-      if (error) throw error;
-
-      setNodes((prev) => [...prev, ...data]);
-      if (data.length > 0) setSelectedNode(data[0]);
-      setAiPrompt("");
-      alert(`AI brain successfully added ${data.length} new milestones!`);
-    } catch (err) {
-      console.error("AI Feature Error:", err);
-      alert("Failed to build milestones: " + err.message);
-    } finally {
-      setAiGenerating(false);
     }
   };
 
@@ -232,7 +287,7 @@ export default function App() {
             {authMode === 'login' ? 'Welcome Back' : 'Create Your Account'}
           </h2>
           <p className="text-sm text-slate-400 text-center mb-6">
-            Track developer milestones visually and structure your features
+            Track developer milestones visually across multiple projects
           </p>
 
           {authError && (
@@ -295,15 +350,55 @@ export default function App() {
 
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans">
-      <header className="h-16 border-b border-slate-800 bg-slate-900/60 backdrop-blur-md px-6 flex items-center justify-between sticky top-0 z-50">
-        <div className="flex items-center gap-3">
-          <div className="p-2 bg-blue-600 rounded-lg">
-            <Layers className="w-5 h-5 text-white" />
-          </div>
-          <span className="font-bold text-lg text-white tracking-wide">DevFlow Visual Tracker</span>
-        </div>
+      <header className="h-16 border-b border-slate-800 bg-slate-900/60 backdrop-blur-md px-6 flex items-center justify-between sticky top-0 z-50 gap-4">
         <div className="flex items-center gap-4">
-          <span className="text-xs bg-slate-800/80 border border-slate-700/50 px-3 py-1.5 rounded-full text-slate-300 flex items-center gap-2">
+          <div className="flex items-center gap-3">
+            <div className="p-2 bg-blue-600 rounded-lg">
+              <Layers className="w-5 h-5 text-white" />
+            </div>
+            <span className="font-bold text-lg text-white tracking-wide hidden sm:inline">DevFlow Visual Tracker</span>
+          </div>
+
+          {/* Multi-Project Workspace Switcher */}
+          <div className="h-6 w-px bg-slate-800 hidden sm:block" />
+          <div className="flex items-center gap-2">
+            <div className="flex items-center gap-2 bg-slate-950 border border-slate-800 rounded-lg px-2.5 py-1.5">
+              <FolderKanban className="w-4 h-4 text-blue-400" />
+              <select
+                value={activeProject?.id || ''}
+                onChange={(e) => handleSelectProject(e.target.value)}
+                className="bg-transparent text-xs font-semibold text-slate-100 focus:outline-none cursor-pointer pr-2"
+              >
+                {projects.map((proj) => (
+                  <option key={proj.id} value={proj.id} className="bg-slate-900 text-white">
+                    {proj.name}
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            <button
+              onClick={() => setIsCreatingProject(!isCreatingProject)}
+              title="Create New Project Workspace"
+              className="p-1.5 bg-blue-600/20 hover:bg-blue-600/30 border border-blue-500/30 text-blue-400 rounded-lg transition-colors"
+            >
+              <Plus className="w-4 h-4" />
+            </button>
+
+            {projects.length > 1 && (
+              <button
+                onClick={handleDeleteCurrentProject}
+                title="Delete Current Project"
+                className="p-1.5 bg-slate-900 hover:bg-red-500/20 border border-slate-800 hover:border-red-500/30 text-slate-400 hover:text-red-400 rounded-lg transition-colors"
+              >
+                <Trash2 className="w-4 h-4" />
+              </button>
+            )}
+          </div>
+        </div>
+
+        <div className="flex items-center gap-3">
+          <span className="text-xs bg-slate-800/80 border border-slate-700/50 px-3 py-1.5 rounded-full text-slate-300 hidden md:flex items-center gap-2">
             <User className="w-3.5 h-3.5 text-blue-400" /> {session.user.email}
           </span>
           <button 
@@ -315,12 +410,47 @@ export default function App() {
         </div>
       </header>
 
+      {/* Inline New Project Creation Bar */}
+      {isCreatingProject && (
+        <div className="bg-slate-900 border-b border-slate-800 px-6 py-3 flex items-center justify-between gap-4">
+          <form onSubmit={handleCreateProject} className="flex items-center gap-3 flex-1 max-w-lg">
+            <span className="text-xs font-semibold text-blue-400 whitespace-nowrap">New Workspace:</span>
+            <input
+              type="text"
+              autoFocus
+              value={newProjectName}
+              onChange={(e) => setNewProjectName(e.target.value)}
+              placeholder="e.g. Coffee Shop Website, Mobile App..."
+              className="flex-1 bg-slate-950 border border-slate-700 rounded-lg px-3 py-1.5 text-xs text-white focus:outline-none focus:border-blue-500"
+            />
+            <button
+              type="submit"
+              className="bg-blue-600 hover:bg-blue-500 text-white text-xs font-semibold px-3.5 py-1.5 rounded-lg transition-colors"
+            >
+              Create
+            </button>
+            <button
+              type="button"
+              onClick={() => { setIsCreatingProject(false); setNewProjectName(''); }}
+              className="text-xs text-slate-400 hover:text-white px-2 py-1.5"
+            >
+              Cancel
+            </button>
+          </form>
+        </div>
+      )}
+
       <div className="flex-1 flex overflow-hidden">
         {/* Left Sidebar Control Panel */}
         <div className="w-80 border-r border-slate-800 bg-slate-900/40 p-5 flex flex-col gap-5 overflow-y-auto shrink-0">
-          {/* Progress Card */}
+          {/* Active Project Progress Card */}
           <div className="bg-slate-900 border border-slate-800 p-4 rounded-xl shadow-sm">
-            <h3 className="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-2">Overall Progress</h3>
+            <div className="flex items-center justify-between mb-2">
+              <h3 className="text-xs font-semibold text-slate-400 uppercase tracking-wider">Workspace Progress</h3>
+              <span className="text-[11px] font-medium text-blue-400 truncate max-w-[120px]">
+                {activeProject?.name}
+              </span>
+            </div>
             <div className="w-full bg-slate-950 h-2.5 rounded-full overflow-hidden mb-2 border border-slate-800">
               <div className="bg-blue-500 h-full transition-all duration-500" style={{ width: `${progressPercent}%` }} />
             </div>
@@ -341,40 +471,10 @@ export default function App() {
                 <p className="text-xs text-slate-400 mt-1">Phase: <span className="text-slate-200">{nextUpNode.phase}</span></p>
               </div>
             ) : (
-              <p className="text-xs text-slate-400">All milestones completed! 🎉</p>
+              <p className="text-xs text-slate-400">
+                {nodes.length === 0 ? 'Add your first milestone below!' : 'All milestones completed! 🎉'}
+              </p>
             )}
-          </div>
-
-          {/* AI Project Planner Input Drawer */}
-          <div className="bg-purple-950/20 border border-purple-800/30 p-4 rounded-xl space-y-3">
-            <div className="flex items-center gap-2 text-purple-400 text-xs font-bold uppercase tracking-wider">
-              <Cpu className="w-4 h-4" /> AI Goal Planner
-            </div>
-            <p className="text-[11px] text-slate-400">Describe what you want to build and let AI automatically structure the milestone workflow.</p>
-            <form onSubmit={handleGenerateAiPlan} className="space-y-2">
-              <textarea
-                value={aiPrompt}
-                onChange={(e) => setAiPrompt(e.target.value)}
-                placeholder="e.g., A peer-to-peer visual car marketplace with React, Node.js, and Stripe..."
-                rows={3}
-                className="w-full bg-slate-950 border border-slate-800 rounded-lg px-2.5 py-2 text-xs focus:outline-none focus:border-purple-500 text-white placeholder-slate-600 resize-none leading-relaxed"
-              />
-              <button 
-                type="submit" 
-                disabled={aiGenerating || !aiPrompt.trim()}
-                className="w-full bg-purple-600 hover:bg-purple-500 disabled:opacity-40 text-white py-2 rounded-lg text-xs font-semibold flex items-center justify-center gap-1.5 transition-all shadow-md shadow-purple-600/10 cursor-pointer"
-              >
-                {aiGenerating ? (
-                  <>
-                    <RefreshCw className="animate-spin w-3.5 h-3.5" /> Drafting Roadmap...
-                  </>
-                ) : (
-                  <>
-                    <Cpu className="w-3.5 h-3.5" /> Create Visual Roadmap
-                  </>
-                )}
-              </button>
-            </form>
           </div>
 
           {/* Add Module Form */}
@@ -452,7 +552,7 @@ export default function App() {
           <div className="flex-1 p-6 overflow-auto flex flex-wrap content-start gap-4">
             {filteredNodes.length === 0 ? (
               <div className="w-full text-center py-20 text-slate-500 text-sm">
-                No feature nodes found. Use the visual addition forms or describe your idea to the AI goal planner to trigger roadmap generation!
+                No module nodes in <span className="text-slate-300 font-semibold">{activeProject?.name}</span> yet. Use the form on the left to add your first milestone!
               </div>
             ) : (
               filteredNodes.map((node) => {
